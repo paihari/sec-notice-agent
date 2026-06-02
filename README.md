@@ -283,6 +283,44 @@ tokens : 92,400 total  (in 4,200, out 1,200, cache_read 68,000, cache_write 19,0
 
 > **On token counts:** in an agentic loop the SDK's reported usage is *cumulative across turns*, so `cache_read` dominates the raw token total while contributing little to actual cost (cache reads are billed at ~0.1×). **Cost (USD) is the metric to watch, not the raw token count.** A routine filing reads `[1 pass]` (triage only); a material one `[2 passes]`.
 
+#### Sample run
+
+*(Illustrative output — scores, reasons, and token figures are representative.)* A batch run over a company's recent 8-Ks shows the full shape: a material filing that goes deep, a routine one that stops at triage, and the grand `TOTAL`:
+
+```text
+$ python -m sec_notice.analyse 1050446 --forms 8-K --limit 3
+Analysing up to 3 fetched filings for CIK 1050446 (forms: 8-K) with claude-opus-4-8 ...
+
+  ▲ filing #48  8-K  filed 2026-05-05  Strategy Inc (MSTR)
+    accession: 0001050446-26-000024
+    score=74  severity=high  action=notify
+    summary: Strategy's Q1 2026 results 8-K (Exhibit 99.1) reports digital-asset holdings of
+      $51.65B, down from $58.85B at year-end 2025, against total assets of $54.27B — i.e. ~95%
+      of the balance sheet is bitcoin. MSTR fell -4.10% on the filing day vs SPY +0.31%.
+      - STATED: Exhibit 99.1 balance sheet shows Digital assets 51,649,675 (000s) vs 58,854,028
+        prior period — a $7.2B decline driven by mark-to-market, not sales.
+      - RELATIVE: Digital assets are 95.2% of $54.27B total assets; concentration risk dominates.
+      - REALIZED: MSTR -4.10% on filing day vs SPY +0.31% and BTC -3.30% over 7 days.
+    tags   : MSTR, bitcoin, earnings, balance-sheet, 8-K, crypto-treasury
+    sources: get_filing_text, get_company_facts, get_prior_filings, get_price_reaction, get_btc_context, WebSearch
+    tokens : 311,942 total  (in 12, out 5,210, cache_read 215,402, cache_write 91,318)  [2 passes]  ~$0.8420
+
+  · filing #2  8-K  filed 2026-06-01  Strategy Inc (MSTR)
+    accession: 0001193125-26-251680
+    score=18  severity=info  action=ignore
+    summary: Administrative 8-K under Item 5.07 reporting routine annual-meeting voting results;
+      no financial or strategic disclosure.
+      - Triage only: stated importance below the deep-analysis floor; market/news cross-check skipped to save cost.
+    tags   : triage-only
+    sources: get_filing_text, get_prior_filings
+    tokens : 22,861 total  (in 9, out 612, cache_read 14,880, cache_write 7,360)  [1 pass]  ~$0.1180
+
+Done. 2 filing(s) analysed.
+TOTAL tokens : 334,803 total  (in 21, out 5,822, cache_read 230,282, cache_write 98,678)  [3 passes]  ~$0.9600
+```
+
+The icons are severity (`·` info · `•` notable · `▲` high · `■` critical). Filing #2 takes the cheap path — `action=ignore`, the `triage-only` tag, and `[1 pass]`: it never paid for the deep cross-check.
+
 ---
 
 ## Project layout
