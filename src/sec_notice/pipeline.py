@@ -323,6 +323,8 @@ def analyse_filing(filing_id: int) -> Analysis:
             session.flush()
             session.refresh(analysis)
             session.expunge(analysis)
+    # Transient attribute (not a DB column): token usage for this run.
+    analysis.usage = result.usage
     return analysis
 
 

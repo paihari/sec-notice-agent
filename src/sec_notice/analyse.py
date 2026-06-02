@@ -14,12 +14,28 @@ from __future__ import annotations
 import argparse
 import sys
 
+from .agent.analyst import add_usage, usage_total_tokens
 from .config import config
 from .pipeline import analyse_filing, analyse_pending
 from .store.db import init_db, session_scope
 from .store.models import Analysis, Company, Filing
 
 _SEV_ICON = {"info": "·", "notable": "•", "high": "▲", "critical": "■"}
+
+
+def _fmt_usage(u: dict | None, prefix: str = "    ") -> str:
+    if not u:
+        return ""
+    total = usage_total_tokens(u)
+    passes = u.get("passes", 1)
+    line = (f"{prefix}tokens : {total:,} total  "
+            f"(in {u.get('input', 0):,}, out {u.get('output', 0):,}, "
+            f"cache_read {u.get('cache_read', 0):,}, "
+            f"cache_write {u.get('cache_creation', 0):,})  "
+            f"[{passes} pass{'es' if passes != 1 else ''}]")
+    if u.get("cost_usd"):
+        line += f"  ~${u['cost_usd']:.4f}"
+    return line
 
 
 def _filing_header(filing_id: int) -> str:
@@ -40,10 +56,13 @@ def _filing_header(filing_id: int) -> str:
 
 
 def _print_verdict(a: Analysis) -> None:
+    usage = getattr(a, "usage", None)
     # Error case: no score was produced (e.g. API billing / rate limit).
     if a.materiality_score is None:
         print(f"\n  ✗ {_filing_header(a.filing_id)}")
         print(f"    NOT ANALYSED: {a.summary}")
+        if usage and usage_total_tokens(usage):
+            print(_fmt_usage(usage))
         return
     icon = _SEV_ICON.get(a.severity or "", "?")
     print(f"\n  {icon} {_filing_header(a.filing_id)}")
@@ -57,6 +76,8 @@ def _print_verdict(a: Analysis) -> None:
         print(f"    tags   : {', '.join(a.tags)}")
     if a.sources_used:
         print(f"    sources: {', '.join(a.sources_used)}")
+    if usage:
+        print(_fmt_usage(usage))
 
 
 def main(argv: list[str]) -> int:
@@ -93,9 +114,13 @@ def main(argv: list[str]) -> int:
     if not results:
         print("\n  No fetched+unanalysed filings matched. "
               "Run `discover` to fetch documents first.")
+    grand: dict = {}
     for a in results:
         _print_verdict(a)
+        grand = add_usage(grand, getattr(a, "usage", None))
     print(f"\nDone. {len(results)} filing(s) analysed.")
+    if usage_total_tokens(grand):
+        print(_fmt_usage(grand, prefix="  TOTAL ").lstrip())
     return 0
 
 

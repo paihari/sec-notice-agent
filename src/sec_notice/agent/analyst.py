@@ -187,10 +187,37 @@ class AnalystResult:
     verdict: dict
     sources_used: list[str]
     model: str
+    usage: dict | None = None
 
     @property
     def ok(self) -> bool:
         return "error" not in self.verdict
+
+
+_USAGE_KEYS = ("input", "output", "cache_read", "cache_creation", "cost_usd", "passes")
+
+
+def _extract_usage(message: ResultMessage) -> dict:
+    u = getattr(message, "usage", None) or {}
+    return {
+        "input": u.get("input_tokens", 0) or 0,
+        "output": u.get("output_tokens", 0) or 0,
+        "cache_read": u.get("cache_read_input_tokens", 0) or 0,
+        "cache_creation": u.get("cache_creation_input_tokens", 0) or 0,
+        "cost_usd": getattr(message, "total_cost_usd", None) or 0.0,
+        "passes": 1,
+    }
+
+
+def add_usage(a: dict | None, b: dict | None) -> dict:
+    a, b = a or {}, b or {}
+    return {k: (a.get(k, 0) + b.get(k, 0)) for k in _USAGE_KEYS}
+
+
+def usage_total_tokens(u: dict | None) -> int:
+    u = u or {}
+    return u.get("input", 0) + u.get("output", 0) + \
+        u.get("cache_read", 0) + u.get("cache_creation", 0)
 
 
 def _explain_failure(exc: Exception | None, last_text: str | None) -> str:
@@ -284,11 +311,12 @@ def _triage_prompt(filing: dict) -> str:
 
 
 async def _drive(options: ClaudeAgentOptions, prompt: str
-                 ) -> tuple[dict | None, list[str], str | None]:
-    """Run one agent query to completion; return (verdict, sources, last_text)."""
+                 ) -> tuple[dict | None, list[str], str | None, dict]:
+    """Run one agent query; return (verdict, sources, last_text, usage)."""
     sources: list[str] = []
     verdict: dict | None = None
     last_text: str | None = None
+    usage: dict = {}
     try:
         async for message in query(prompt=prompt, options=options):
             if isinstance(message, AssistantMessage):
@@ -301,6 +329,7 @@ async def _drive(options: ClaudeAgentOptions, prompt: str
                         if clean != "StructuredOutput":  # SDK output mechanism
                             sources.append(clean)
             elif isinstance(message, ResultMessage):
+                usage = _extract_usage(message)
                 verdict = getattr(message, "structured_output", None)
                 if verdict is None and getattr(message, "result", None):
                     try:
@@ -312,7 +341,7 @@ async def _drive(options: ClaudeAgentOptions, prompt: str
         # The SDK raises when the CLI returns an error result (e.g. billing,
         # rate limit). The model's last text often holds the real reason.
         verdict = {"error": _explain_failure(exc, last_text)}
-    return verdict, _dedup(sources), last_text
+    return verdict, _dedup(sources), last_text, usage
 
 
 def _verdict_from_triage(t: dict) -> dict:
@@ -332,24 +361,26 @@ async def _run(filing: dict) -> AnalystResult:
     model = config.analyst_model
 
     # Pass 1: cheap triage.
-    tverdict, tsources, tlast = await _drive(_build_triage_options(),
-                                             _triage_prompt(filing))
+    tverdict, tsources, tlast, tusage = await _drive(_build_triage_options(),
+                                                     _triage_prompt(filing))
     if tverdict is None:
         tverdict = {"error": _explain_failure(None, tlast)}
     if "error" in tverdict:
-        return AnalystResult(tverdict, tsources, model)
+        return AnalystResult(tverdict, tsources, model, tusage)
 
     stated = int(tverdict.get("stated_score") or 0)
     go_deep = bool(tverdict.get("recommend_deep")) or stated >= config.triage_floor
     if not go_deep:
         return AnalystResult(_verdict_from_triage(tverdict),
-                             tsources or ["get_filing_text"], model)
+                             tsources or ["get_filing_text"], model, tusage)
 
     # Pass 2: full cross-check (only for filings that cleared the floor).
-    fverdict, fsources, flast = await _drive(_build_options(), _prompt_for(filing))
+    fverdict, fsources, flast, fusage = await _drive(_build_options(),
+                                                     _prompt_for(filing))
     if fverdict is None:
         fverdict = {"error": _explain_failure(None, flast)}
-    return AnalystResult(fverdict, _dedup(tsources + fsources), model)
+    return AnalystResult(fverdict, _dedup(tsources + fsources), model,
+                         add_usage(tusage, fusage))
 
 
 def analyse(filing: dict) -> AnalystResult:
