@@ -14,7 +14,7 @@ import re
 import warnings
 from dataclasses import dataclass, field
 
-from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+from bs4 import BeautifulSoup, NavigableString, XMLParsedAsHTMLWarning
 
 from .client import EdgarClient
 
@@ -97,16 +97,76 @@ def _idx(seq, i):
     return seq[i] if seq and i < len(seq) else None
 
 
+def _cell_text(cell) -> str:
+    return " ".join(cell.get_text(" ", strip=True).split())
+
+
+def _table_to_markdown(table) -> str:
+    """Render an HTML <table> as a GitHub-flavored markdown table.
+
+    Columns that are empty in every row are dropped — SEC filings pad number
+    columns with spacer cells for visual alignment ($ in one <td>, the figure
+    in the next), so pruning keeps the output compact and readable (and saves
+    tokens downstream). Returns "" for a table with no usable cells.
+    """
+    rows: list[list[str]] = []
+    for tr in table.find_all("tr"):
+        cells = tr.find_all(["th", "td"])
+        row = [_cell_text(c) for c in cells]
+        if any(row):
+            rows.append(row)
+    if not rows:
+        return ""
+    ncol = max(len(r) for r in rows)
+    rows = [r + [""] * (ncol - len(r)) for r in rows]
+    keep = [c for c in range(ncol) if any(r[c] for r in rows)]
+    if not keep:
+        return ""
+    rows = [[r[c] for c in keep] for r in rows]
+    header, *body = rows
+    md = ["| " + " | ".join(header) + " |",
+          "| " + " | ".join("---" for _ in header) + " |"]
+    md += ["| " + " | ".join(r) + " |" for r in body]
+    return "\n".join(md)
+
+
+def _html_to_text(content: bytes) -> str:
+    """Readable text from an HTML filing, with tables preserved as markdown.
+
+    Prose is flattened to spaces (as before), but each top-level table is
+    rendered to a markdown block in place, so the analyst sees row/column
+    relationships instead of an unreadable run of numbers. Nested tables (used
+    for page layout) are captured as their cells' text.
+    """
+    soup = BeautifulSoup(content, "lxml")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    # Swap each table for a sentinel token now; render markdown after the prose
+    # is flattened, so table newlines survive the space-joined get_text().
+    placeholders: dict[str, str] = {}
+    top_tables = [t for t in soup.find_all("table") if not t.find_parent("table")]
+    for i, table in enumerate(top_tables):
+        token = f"\x00TBL{i}\x00"
+        placeholders[token] = _table_to_markdown(table)
+        table.replace_with(NavigableString(token))
+
+    text = re.sub(r"[ \t]+", " ", soup.get_text(separator=" ", strip=True))
+    for token, md in placeholders.items():
+        text = text.replace(token, f"\n\n{md}\n\n" if md else " ")
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 def extract_text(content: bytes, filename: str) -> str | None:
-    """Plain text from an HTML/text document; None for binary docs."""
+    """Plain text from an HTML/text document; None for binary docs.
+
+    HTML is rendered with table structure preserved as markdown; .txt is
+    returned as-is.
+    """
     if not filename.lower().endswith(_TEXT_EXTENSIONS):
         return None
     if filename.lower().endswith(".txt"):
         return content.decode("utf-8", errors="replace")
-    soup = BeautifulSoup(content, "lxml")
-    for tag in soup(["script", "style"]):
-        tag.decompose()
-    return soup.get_text(separator=" ", strip=True)
+    return _html_to_text(content)
 
 
 def archive_base_url(cik: int, accession_nodash: str) -> str:
