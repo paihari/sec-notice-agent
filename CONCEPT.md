@@ -134,19 +134,52 @@ structured result via a `submit_assessment` tool (forces clean JSON output).
 }
 ```
 
-**Tools** (you'll supply the real implementations — these are the slots the
-agent reaches for):
-- `get_filing_text(filing_id)` — full/section text of the current filing.
-- `get_prior_filings(cik, form_type, n)` — context for "is this a change?"
-- *(your tools)* — e.g. price/market lookups, internal classifiers, a
-  knowledge base, XBRL number extraction, etc. The agent loop is tool-agnostic,
-  so adding a tool is just registering it with the SDK.
-
 **Why Agent SDK over a hand-rolled loop:** native tool-calling loop, retries,
-and message management are handled for us; plugging in your tools is a
-registration call rather than wiring a custom dispatch loop. Uses the latest
-Claude model (e.g. Opus/Sonnet 4.x) with prompt caching on the system prompt +
-filing text to keep cost down.
+and message management are handled for us; plugging in tools is a registration
+call rather than wiring a custom dispatch loop. Uses the latest Claude model
+(e.g. Opus/Sonnet 4.x) with prompt caching on the system prompt + filing text
+to keep cost down.
+
+---
+
+## 5.1 Cross-check sources (impact analysis)
+
+A filing read in isolation only tells us what the company *says*. Materiality is
+triangulated across three lenses:
+
+| Lens | Question | Source |
+|---|---|---|
+| **Stated** | What does the filing claim? | the filing (ingested) |
+| **Relative** | Is this a change vs history / scale? | prior filings, fundamentals |
+| **Realized** | Did the market actually react? | price/volume, news, on-chain |
+
+**Tool roster the agent gets (Phase 3):**
+
+| Tool | Purpose | Backing source | Dependency |
+|---|---|---|---|
+| `get_filing_text` | full / section text of current filing | our DB | — |
+| `get_prior_filings` | "is this a change?" context | our DB | — |
+| `get_insider_activity` | Form 4 buys/sells in a window | our DB | — |
+| `get_company_facts` | scale a number vs revenue / market cap | SEC XBRL `companyfacts` API | free |
+| `get_price_reaction` | filing-day + next-day return vs 30-day avg volume | `yfinance` | free (key-less) |
+| `search_news` | corroboration, analyst takes, narrative | built-in **WebSearch** | already here |
+| `get_btc_context` | BTC price + on-chain context (for crypto-linked issuers like MSTR) | **Dune MCP** | already connected |
+| `submit_assessment` | emit the structured verdict (forces clean JSON) | — | — |
+
+Design guards baked into the tools:
+- **De-confound** — `get_price_reaction` also returns a sector/market baseline so
+  a macro-wide move isn't mis-credited to the filing.
+- **No look-ahead** — every external tool takes the filing date; for backfilled
+  filings it only uses data available *as of* that date.
+- **Cite-or-omit** — any figure in the verdict must come from a tool result;
+  high-score findings get an adversarial verify pass before notifying.
+- **Cost control** — only forms above a materiality floor (8-K / 10-K / 10-Q by
+  default) get the full external cross-check; routine forms (Form 4, etc.) are
+  scored cheaply or skipped.
+
+Agent loop: *read filing → quick stated score → if material form & above floor,
+pull reaction + fundamentals + news (+ BTC for crypto issuers) → reconcile into a
+final cited score → verify → hand to NOTIFY.*
 
 ---
 
