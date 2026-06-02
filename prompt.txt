@@ -1,0 +1,7 @@
+I came across this SEC file website. which lists all the filings
+
+https://www.sec.gov/Archives/edgar/data/1050446/000119312526249768/mstr-20260530.htm
+
+I noticed the filings are put in the https://www.sec.gov/Archives/edgar/data/1050446, could you propose me and app, which will take invidual filing and store in a database
+
+Come up with the concept.
