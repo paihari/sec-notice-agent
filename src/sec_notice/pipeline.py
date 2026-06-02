@@ -23,7 +23,7 @@ from .edgar.fetch import (
     fetch_filing,
 )
 from .store.db import init_db, session_scope
-from .store.models import Company, Document, Filing
+from .store.models import Analysis, Company, Document, Filing
 
 
 # --------------------------------------------------------------------------- #
@@ -273,3 +273,81 @@ def backfill_company(
         new_filings=new_count,
         docs_fetched=docs_fetched,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3: AI materiality analysis
+# --------------------------------------------------------------------------- #
+def analyse_filing(filing_id: int) -> Analysis:
+    """Run the AI analyst on one fetched filing and persist the verdict.
+
+    Advances the filing from 'fetched' to 'analysed'. Imported lazily so the
+    rest of the pipeline doesn't require the Agent SDK.
+    """
+    from .agent.analyst import analyse as run_analyst
+
+    with session_scope() as session:
+        filing = session.get(Filing, filing_id)
+        if filing is None:
+            raise ValueError(f"filing {filing_id} not found")
+        company = session.get(Company, filing.cik)
+        ctx = {
+            "filing_id": filing.id,
+            "cik": filing.cik,
+            "form_type": filing.form_type,
+            "filing_date": filing.filing_date,
+            "company": company.name if company else None,
+            "ticker": company.ticker if company else None,
+        }
+
+    result = run_analyst(ctx)
+    v = result.verdict
+
+    with session_scope() as session:
+        filing = session.get(Filing, filing_id)
+        analysis = Analysis(
+            filing_id=filing_id,
+            model=result.model,
+            materiality_score=v.get("materiality_score"),
+            severity=v.get("severity"),
+            recommended_action=v.get("recommended_action"),
+            summary=v.get("summary") or v.get("error"),
+            reasons=v.get("reasons"),
+            tags=v.get("tags"),
+            sources_used=result.sources_used,
+        )
+        session.add(analysis)
+        if "error" not in v:
+            filing.status = "analysed"
+        session.flush()
+        session.refresh(analysis)
+        session.expunge(analysis)
+        return analysis
+
+
+def analyse_pending(
+    cik: int,
+    *,
+    forms: set[str] | None = None,
+    limit: int | None = None,
+) -> list[Analysis]:
+    """Analyse fetched-but-not-analysed filings for a CIK (material forms only).
+
+    ``forms`` defaults to the configured material forms. Newest first.
+    """
+    forms = forms or set(config.material_forms)
+    with session_scope() as session:
+        stmt = (
+            select(Filing.id)
+            .where(Filing.cik == cik, Filing.status == "fetched")
+            .order_by(Filing.filing_date.desc())
+        )
+        if forms:
+            stmt = stmt.where(
+                func.upper(Filing.form_type).in_({f.upper() for f in forms})
+            )
+        ids = list(session.scalars(stmt).all())
+    if limit is not None:
+        ids = ids[:limit]
+
+    return [analyse_filing(fid) for fid in ids]

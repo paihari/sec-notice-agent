@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     DateTime,
     ForeignKey,
@@ -79,3 +80,23 @@ class Document(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
     filing: Mapped["Filing"] = relationship(back_populates="documents")
+
+
+class Analysis(Base):
+    """One materiality assessment of a filing produced by the AI analyst."""
+
+    __tablename__ = "analyses"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    filing_id: Mapped[int] = mapped_column(ForeignKey("filings.id"), index=True)
+    model: Mapped[str | None] = mapped_column(String(64))
+    materiality_score: Mapped[int | None] = mapped_column(Integer)
+    severity: Mapped[str | None] = mapped_column(String(16))
+    recommended_action: Mapped[str | None] = mapped_column(String(16))
+    summary: Mapped[str | None] = mapped_column(Text)
+    reasons: Mapped[list | None] = mapped_column(JSON)
+    tags: Mapped[list | None] = mapped_column(JSON)
+    sources_used: Mapped[list | None] = mapped_column(JSON)  # tool-call trace
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+    filing: Mapped["Filing"] = relationship()
