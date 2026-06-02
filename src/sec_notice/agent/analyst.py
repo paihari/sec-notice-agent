@@ -276,13 +276,10 @@ def _build_options() -> ClaudeAgentOptions:
 
 
 def _build_triage_options() -> ClaudeAgentOptions:
-    """Triage pass: filing text + prior filings only, no WebSearch.
-
-    Runs on the cheap triage model (Haiku by default) — the whole point of the
-    two-pass design is that a routine filing never pays for an Opus pass."""
+    """Triage pass: filing text + prior filings only, no WebSearch."""
     return ClaudeAgentOptions(
         system_prompt=TRIAGE_SYSTEM_PROMPT,
-        model=config.triage_model,
+        model=config.analyst_model,
         max_turns=6,
         tools=[],  # no built-in tools (no WebSearch)
         mcp_servers={SERVER_NAME: _server()},
@@ -361,29 +358,29 @@ def _verdict_from_triage(t: dict) -> dict:
 
 
 async def _run(filing: dict) -> AnalystResult:
-    # Pass 1: cheap triage (Haiku by default).
+    model = config.analyst_model
+
+    # Pass 1: cheap triage.
     tverdict, tsources, tlast, tusage = await _drive(_build_triage_options(),
                                                      _triage_prompt(filing))
     if tverdict is None:
         tverdict = {"error": _explain_failure(None, tlast)}
     if "error" in tverdict:
-        return AnalystResult(tverdict, tsources, config.triage_model, tusage)
+        return AnalystResult(tverdict, tsources, model, tusage)
 
     stated = int(tverdict.get("stated_score") or 0)
     go_deep = bool(tverdict.get("recommend_deep")) or stated >= config.triage_floor
     if not go_deep:
-        # Verdict came entirely from the triage model.
         return AnalystResult(_verdict_from_triage(tverdict),
-                             tsources or ["get_filing_text"],
-                             config.triage_model, tusage)
+                             tsources or ["get_filing_text"], model, tusage)
 
-    # Pass 2: full cross-check on the analyst model (only past the floor).
+    # Pass 2: full cross-check (only for filings that cleared the floor).
     fverdict, fsources, flast, fusage = await _drive(_build_options(),
                                                      _prompt_for(filing))
     if fverdict is None:
         fverdict = {"error": _explain_failure(None, flast)}
-    return AnalystResult(fverdict, _dedup(tsources + fsources),
-                         config.analyst_model, add_usage(tusage, fusage))
+    return AnalystResult(fverdict, _dedup(tsources + fsources), model,
+                         add_usage(tusage, fusage))
 
 
 def analyse(filing: dict) -> AnalystResult:
