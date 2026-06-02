@@ -302,27 +302,28 @@ def analyse_filing(filing_id: int) -> Analysis:
 
     result = run_analyst(ctx)
     v = result.verdict
-
-    with session_scope() as session:
-        filing = session.get(Filing, filing_id)
-        analysis = Analysis(
-            filing_id=filing_id,
-            model=result.model,
-            materiality_score=v.get("materiality_score"),
-            severity=v.get("severity"),
-            recommended_action=v.get("recommended_action"),
-            summary=v.get("summary") or v.get("error"),
-            reasons=v.get("reasons"),
-            tags=v.get("tags"),
-            sources_used=result.sources_used,
-        )
-        session.add(analysis)
-        if "error" not in v:
+    analysis = Analysis(
+        filing_id=filing_id,
+        model=result.model,
+        materiality_score=v.get("materiality_score"),
+        severity=v.get("severity"),
+        recommended_action=v.get("recommended_action"),
+        summary=v.get("summary") or v.get("error"),
+        reasons=v.get("reasons"),
+        tags=v.get("tags"),
+        sources_used=result.sources_used,
+    )
+    # Only persist + advance status on a real verdict; error results (billing,
+    # rate limit, etc.) are returned for display but not stored.
+    if result.ok:
+        with session_scope() as session:
+            filing = session.get(Filing, filing_id)
+            session.add(analysis)
             filing.status = "analysed"
-        session.flush()
-        session.refresh(analysis)
-        session.expunge(analysis)
-        return analysis
+            session.flush()
+            session.refresh(analysis)
+            session.expunge(analysis)
+    return analysis
 
 
 def analyse_pending(
@@ -350,4 +351,12 @@ def analyse_pending(
     if limit is not None:
         ids = ids[:limit]
 
-    return [analyse_filing(fid) for fid in ids]
+    results: list[Analysis] = []
+    for fid in ids:
+        analysis = analyse_filing(fid)
+        results.append(analysis)
+        # Stop early on a failed analysis — errors here (billing, rate limit)
+        # are almost always global, so continuing would just burn API calls.
+        if analysis.materiality_score is None:
+            break
+    return results

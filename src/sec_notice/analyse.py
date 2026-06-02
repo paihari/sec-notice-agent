@@ -40,6 +40,11 @@ def _filing_header(filing_id: int) -> str:
 
 
 def _print_verdict(a: Analysis) -> None:
+    # Error case: no score was produced (e.g. API billing / rate limit).
+    if a.materiality_score is None:
+        print(f"\n  ✗ {_filing_header(a.filing_id)}")
+        print(f"    NOT ANALYSED: {a.summary}")
+        return
     icon = _SEV_ICON.get(a.severity or "", "?")
     print(f"\n  {icon} {_filing_header(a.filing_id)}")
     print(f"    score={a.materiality_score}  severity={a.severity}  "

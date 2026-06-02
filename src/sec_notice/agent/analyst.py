@@ -17,6 +17,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ResultMessage,
+    TextBlock,
     create_sdk_mcp_server,
     query,
     tool,
@@ -148,6 +149,24 @@ class AnalystResult:
     sources_used: list[str]
     model: str
 
+    @property
+    def ok(self) -> bool:
+        return "error" not in self.verdict
+
+
+def _explain_failure(exc: Exception | None, last_text: str | None) -> str:
+    """Turn an opaque SDK/CLI failure into an actionable message."""
+    text = (last_text or "").lower()
+    if "credit balance is too low" in text or "credit balance" in text:
+        return ("Anthropic API credit balance is too low — add credits at "
+                "console.anthropic.com (Plan & Billing), then retry. "
+                "(The pipeline code is fine; the API call was refused.)")
+    if "rate limit" in text or "rate_limit" in text:
+        return "Anthropic API rate limited — wait and retry."
+    if last_text:
+        return f"Agent run failed: {last_text}"
+    return f"Agent run failed: {exc}" if exc else "Agent produced no result."
+
 
 def _build_options() -> ClaudeAgentOptions:
     server = create_sdk_mcp_server(name=SERVER_NAME, version="0.1.0", tools=_TOOLS)
@@ -183,26 +202,34 @@ async def _run(filing: dict) -> AnalystResult:
     options = _build_options()
     sources: list[str] = []
     verdict: dict | None = None
+    last_text: str | None = None
 
-    async for message in query(prompt=_prompt_for(filing), options=options):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                name = getattr(block, "name", None)
-                if name and getattr(block, "input", None) is not None:
-                    clean = name.replace(f"mcp__{SERVER_NAME}__", "")
-                    if clean != "StructuredOutput":  # SDK output mechanism, not a source
-                        sources.append(clean)
-        elif isinstance(message, ResultMessage):
-            verdict = getattr(message, "structured_output", None)
-            if verdict is None and getattr(message, "result", None):
-                try:
-                    verdict = json.loads(message.result)
-                except (json.JSONDecodeError, TypeError):
-                    verdict = {"error": "no structured output",
-                               "raw": message.result}
+    try:
+        async for message in query(prompt=_prompt_for(filing), options=options):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock) and block.text.strip():
+                        last_text = block.text.strip()
+                    name = getattr(block, "name", None)
+                    if name and getattr(block, "input", None) is not None:
+                        clean = name.replace(f"mcp__{SERVER_NAME}__", "")
+                        if clean != "StructuredOutput":  # SDK output mechanism
+                            sources.append(clean)
+            elif isinstance(message, ResultMessage):
+                verdict = getattr(message, "structured_output", None)
+                if verdict is None and getattr(message, "result", None):
+                    try:
+                        verdict = json.loads(message.result)
+                    except (json.JSONDecodeError, TypeError):
+                        verdict = {"error": "no structured output",
+                                   "raw": message.result}
+    except Exception as exc:  # noqa: BLE001
+        # The SDK raises when the CLI returns an error result (e.g. billing,
+        # rate limit). The model's last text often holds the real reason.
+        verdict = {"error": _explain_failure(exc, last_text)}
 
     if verdict is None:
-        verdict = {"error": "agent produced no result"}
+        verdict = {"error": _explain_failure(None, last_text)}
     # de-dup sources, preserve order
     seen, ordered = set(), []
     for s in sources:
