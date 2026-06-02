@@ -109,45 +109,72 @@ def extract_text(content: bytes, filename: str) -> str | None:
     return soup.get_text(separator=" ", strip=True)
 
 
-def fetch_filing(url: str, *, download_text_only: bool = True) -> FilingRef:
+def archive_base_url(cik: int, accession_nodash: str) -> str:
+    return f"{ARCHIVES_BASE}/{cik}/{accession_nodash}"
+
+
+def fetch_documents(
+    client: EdgarClient,
+    cik: int,
+    accession_nodash: str,
+    *,
+    download_text_only: bool = True,
+) -> list[DocumentRef]:
+    """List a filing's documents via index.json and download the text ones.
+
+    Uses the supplied client so callers (e.g. backfill) can reuse one
+    throttled connection across many filings.
+    """
+    base_url = archive_base_url(cik, accession_nodash)
+    index = client.get_json(f"{base_url}/index.json")
+    items = (index.get("directory") or {}).get("item") or []
+
+    docs: list[DocumentRef] = []
+    for item in items:
+        name = item.get("name")
+        if not name or name.endswith("/"):
+            continue
+        # index.json's "type" is the row-icon filename (e.g. "text.gif"),
+        # not a document type. Derive a useful type from the extension.
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        doc = DocumentRef(
+            filename=name,
+            url=f"{base_url}/{name}",
+            doc_type=ext or None,
+            size=int(item["size"]) if item.get("size") else None,
+        )
+        is_text = name.lower().endswith(_TEXT_EXTENSIONS)
+        if is_text or not download_text_only:
+            doc.content = client.get_bytes(doc.url)
+            doc.text = extract_text(doc.content, name)
+        docs.append(doc)
+    return docs
+
+
+def fetch_filing(
+    url: str, *, client: EdgarClient | None = None, download_text_only: bool = True
+) -> FilingRef:
     """Resolve a filing URL to a fully-populated FilingRef with documents.
 
     download_text_only: when True, only HTML/text documents are downloaded and
     text-extracted (Phase 1 default). Other documents are recorded as metadata.
     """
     cik, accession_nodash = parse_filing_url(url)
-    accession_no = _dash_accession(accession_nodash)
-    base_url = f"{ARCHIVES_BASE}/{cik}/{accession_nodash}"
-
     ref = FilingRef(
         cik=cik,
-        accession_no=accession_no,
+        accession_no=_dash_accession(accession_nodash),
         accession_nodash=accession_nodash,
-        base_url=base_url,
+        base_url=archive_base_url(cik, accession_nodash),
     )
 
-    with EdgarClient() as client:
+    owns_client = client is None
+    client = client or EdgarClient()
+    try:
         _enrich_from_submissions(client, ref)
-
-        index = client.get_json(f"{base_url}/index.json")
-        items = (index.get("directory") or {}).get("item") or []
-        for item in items:
-            name = item.get("name")
-            if not name or name.endswith("/"):
-                continue
-            # index.json's "type" is the row-icon filename (e.g. "text.gif"),
-            # not a document type. Derive a useful type from the extension.
-            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-            doc = DocumentRef(
-                filename=name,
-                url=f"{base_url}/{name}",
-                doc_type=ext or None,
-                size=int(item["size"]) if item.get("size") else None,
-            )
-            is_text = name.lower().endswith(_TEXT_EXTENSIONS)
-            if is_text or not download_text_only:
-                doc.content = client.get_bytes(doc.url)
-                doc.text = extract_text(doc.content, name)
-            ref.documents.append(doc)
-
+        ref.documents = fetch_documents(
+            client, cik, accession_nodash, download_text_only=download_text_only
+        )
+    finally:
+        if owns_client:
+            client.close()
     return ref
