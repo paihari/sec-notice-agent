@@ -28,6 +28,7 @@ class Config:
     analyst_model: str
     material_forms: frozenset[str]
     materiality_threshold: int
+    triage_floor: int
 
     @classmethod
     def load(cls) -> "Config":
@@ -47,6 +48,7 @@ class Config:
             analyst_model=os.getenv("ANALYST_MODEL", "claude-opus-4-8"),
             material_forms=frozenset(forms),
             materiality_threshold=int(os.getenv("MATERIALITY_THRESHOLD", "60")),
+            triage_floor=int(os.getenv("TRIAGE_FLOOR", "40")),
         )
 
 

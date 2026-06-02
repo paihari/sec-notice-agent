@@ -143,6 +143,45 @@ When done, output the structured verdict.
 """
 
 
+# --------------------------------------------------------------------------- #
+# Triage pass — cheap, no external tools, gates the deep cross-check
+# --------------------------------------------------------------------------- #
+TRIAGE_ALLOWED = [
+    f"mcp__{SERVER_NAME}__get_filing_text",
+    f"mcp__{SERVER_NAME}__get_prior_filings",
+]
+
+TRIAGE_SCHEMA = {
+    "type": "json_schema",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "stated_score": {"type": "integer", "minimum": 0, "maximum": 100},
+            "summary": {"type": "string"},
+            "recommend_deep": {"type": "boolean"},
+        },
+        "required": ["stated_score", "summary", "recommend_deep"],
+    },
+}
+
+TRIAGE_SYSTEM_PROMPT = """\
+You are a fast SEC-filing triage screener. Read the filing text (call \
+get_filing_text; optionally get_prior_filings to judge novelty) and decide \
+whether it is worth an expensive deep cross-check (market reaction, news, etc.).
+
+Return:
+- stated_score (0-100): importance ON THE FACE of the filing, before any market \
+check. Routine/administrative filings score low.
+- summary: 1-2 sentences.
+- recommend_deep: true if the filing is potentially market-moving — e.g. M&A, \
+guidance changes, earnings surprises, material agreements, debt/equity issuance \
+or repurchase, dividends, bitcoin/crypto purchases or SALES, executive changes, \
+litigation, going-concern, restatements. false for purely routine disclosures.
+
+Do not call market/news tools — they are unavailable in this pass. \
+Output the structured result."""
+
+
 @dataclass
 class AnalystResult:
     verdict: dict
@@ -157,7 +196,7 @@ class AnalystResult:
 def _explain_failure(exc: Exception | None, last_text: str | None) -> str:
     """Turn an opaque SDK/CLI failure into an actionable message."""
     text = (last_text or "").lower()
-    if "credit balance is too low" in text or "credit balance" in text:
+    if "credit balance" in text:
         return ("Anthropic API credit balance is too low — add credits at "
                 "console.anthropic.com (Plan & Billing), then retry. "
                 "(The pipeline code is fine; the API call was refused.)")
@@ -168,44 +207,90 @@ def _explain_failure(exc: Exception | None, last_text: str | None) -> str:
     return f"Agent run failed: {exc}" if exc else "Agent produced no result."
 
 
+def _dedup(seq: list[str]) -> list[str]:
+    seen, out = set(), []
+    for s in seq:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def _severity_for(score: int) -> str:
+    if score < 40:
+        return "info"
+    if score < 60:
+        return "notable"
+    if score < 80:
+        return "high"
+    return "critical"
+
+
+def _server() -> object:
+    return create_sdk_mcp_server(name=SERVER_NAME, version="0.1.0", tools=_TOOLS)
+
+
+def _env() -> dict:
+    return {"ANTHROPIC_API_KEY": config.anthropic_api_key} if config.anthropic_api_key else {}
+
+
 def _build_options() -> ClaudeAgentOptions:
-    server = create_sdk_mcp_server(name=SERVER_NAME, version="0.1.0", tools=_TOOLS)
-    env = {}
-    if config.anthropic_api_key:
-        env["ANTHROPIC_API_KEY"] = config.anthropic_api_key
+    """Full cross-check pass: all tools + WebSearch."""
     return ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
         model=config.analyst_model,
         max_turns=16,
         tools=["WebSearch"],
-        mcp_servers={SERVER_NAME: server},
+        mcp_servers={SERVER_NAME: _server()},
         allowed_tools=ALLOWED_TOOLS,
         output_format=VERDICT_SCHEMA,
-        env=env,
+        env=_env(),
     )
 
 
-def _prompt_for(filing: dict) -> str:
+def _build_triage_options() -> ClaudeAgentOptions:
+    """Triage pass: filing text + prior filings only, no WebSearch."""
+    return ClaudeAgentOptions(
+        system_prompt=TRIAGE_SYSTEM_PROMPT,
+        model=config.analyst_model,
+        max_turns=6,
+        tools=[],  # no built-in tools (no WebSearch)
+        mcp_servers={SERVER_NAME: _server()},
+        allowed_tools=TRIAGE_ALLOWED,
+        output_format=TRIAGE_SCHEMA,
+        env=_env(),
+    )
+
+
+def _filing_lines(filing: dict) -> str:
     return (
-        "Analyse this SEC filing for materiality.\n"
         f"- filing_id: {filing['filing_id']}\n"
         f"- cik: {filing['cik']}\n"
         f"- company: {filing.get('company')}\n"
         f"- ticker: {filing.get('ticker')}\n"
         f"- form_type: {filing.get('form_type')}\n"
         f"- filing_date: {filing.get('filing_date')}\n"
-        "Use the tools, then output the structured verdict."
     )
 
 
-async def _run(filing: dict) -> AnalystResult:
-    options = _build_options()
+def _prompt_for(filing: dict) -> str:
+    return ("Analyse this SEC filing for materiality.\n" + _filing_lines(filing)
+            + "Use the tools, then output the structured verdict.")
+
+
+def _triage_prompt(filing: dict) -> str:
+    return ("Triage this SEC filing.\n" + _filing_lines(filing)
+            + "Decide whether it warrants a deep cross-check.")
+
+
+async def _drive(options: ClaudeAgentOptions, prompt: str
+                 ) -> tuple[dict | None, list[str], str | None]:
+    """Run one agent query to completion; return (verdict, sources, last_text)."""
     sources: list[str] = []
     verdict: dict | None = None
     last_text: str | None = None
-
     try:
-        async for message in query(prompt=_prompt_for(filing), options=options):
+        async for message in query(prompt=prompt, options=options):
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock) and block.text.strip():
@@ -227,17 +312,44 @@ async def _run(filing: dict) -> AnalystResult:
         # The SDK raises when the CLI returns an error result (e.g. billing,
         # rate limit). The model's last text often holds the real reason.
         verdict = {"error": _explain_failure(exc, last_text)}
+    return verdict, _dedup(sources), last_text
 
-    if verdict is None:
-        verdict = {"error": _explain_failure(None, last_text)}
-    # de-dup sources, preserve order
-    seen, ordered = set(), []
-    for s in sources:
-        if s not in seen:
-            seen.add(s)
-            ordered.append(s)
-    return AnalystResult(verdict=verdict, sources_used=ordered,
-                         model=config.analyst_model)
+
+def _verdict_from_triage(t: dict) -> dict:
+    score = int(t.get("stated_score") or 0)
+    return {
+        "materiality_score": score,
+        "severity": _severity_for(score),
+        "recommended_action": "ignore",
+        "summary": t.get("summary"),
+        "reasons": ["Triage only: stated importance below the deep-analysis "
+                    "floor; market/news cross-check skipped to save cost."],
+        "tags": ["triage-only"],
+    }
+
+
+async def _run(filing: dict) -> AnalystResult:
+    model = config.analyst_model
+
+    # Pass 1: cheap triage.
+    tverdict, tsources, tlast = await _drive(_build_triage_options(),
+                                             _triage_prompt(filing))
+    if tverdict is None:
+        tverdict = {"error": _explain_failure(None, tlast)}
+    if "error" in tverdict:
+        return AnalystResult(tverdict, tsources, model)
+
+    stated = int(tverdict.get("stated_score") or 0)
+    go_deep = bool(tverdict.get("recommend_deep")) or stated >= config.triage_floor
+    if not go_deep:
+        return AnalystResult(_verdict_from_triage(tverdict),
+                             tsources or ["get_filing_text"], model)
+
+    # Pass 2: full cross-check (only for filings that cleared the floor).
+    fverdict, fsources, flast = await _drive(_build_options(), _prompt_for(filing))
+    if fverdict is None:
+        fverdict = {"error": _explain_failure(None, flast)}
+    return AnalystResult(fverdict, _dedup(tsources + fsources), model)
 
 
 def analyse(filing: dict) -> AnalystResult:

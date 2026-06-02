@@ -25,7 +25,33 @@ from ..store.models import Company, Document, Filing
 COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
 COINGECKO_HISTORY = "https://api.coingecko.com/api/v3/coins/bitcoin/history"
 
-_FILING_TEXT_MAX = 40_000
+_FILING_TEXT_MAX = 12_000
+
+# Markers where the human-readable filing body begins (after any inline-XBRL
+# token soup the HTML parser dumps at the top of the document).
+_BODY_MARKERS = (
+    "UNITED STATES SECURITIES AND EXCHANGE COMMISSION",
+    "SECURITIES AND EXCHANGE COMMISSION",
+    "FORM 8-K",
+    "FORM 10-K",
+    "FORM 10-Q",
+)
+_XBRL_HINTS = ("us-gaap:", "dei:", "xbrli", "Member ", "iso4217")
+
+
+def _strip_xbrl_prefix(text: str) -> str:
+    """Drop the leading inline-XBRL tag dump that precedes the document body.
+
+    Only strips when the leading chunk actually looks like XBRL, so plain-text
+    filings are left untouched.
+    """
+    for marker in _BODY_MARKERS:
+        idx = text.find(marker)
+        if idx > 0:
+            prefix = text[:idx]
+            if any(h in prefix for h in _XBRL_HINTS):
+                return text[idx:]
+    return text
 
 
 def _parse_date(s: str | None) -> date | None:
@@ -75,6 +101,7 @@ def get_filing_text(filing_id: int) -> dict:
         if text is None:
             return {"error": "no extracted text for this filing (run fetch first)"}
 
+        text = _strip_xbrl_prefix(text)
         return {
             "filing_id": f.id,
             "form_type": f.form_type,

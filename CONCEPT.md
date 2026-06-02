@@ -173,9 +173,12 @@ Design guards baked into the tools:
   filings it only uses data available *as of* that date.
 - **Cite-or-omit** — any figure in the verdict must come from a tool result;
   high-score findings get an adversarial verify pass before notifying.
-- **Cost control** — only forms above a materiality floor (8-K / 10-K / 10-Q by
-  default) get the full external cross-check; routine forms (Form 4, etc.) are
-  scored cheaply or skipped.
+- **Cost control** — two passes. A cheap *triage* pass reads only the (trimmed,
+  XBRL-stripped) filing text + prior filings and assigns a stated score; only
+  filings at/above `TRIAGE_FLOOR` (or flagged market-moving) get the expensive
+  *full* pass with price/BTC/fundamentals/WebSearch. Plus a form filter (8-K /
+  10-K / 10-Q) before either pass. Agentic loops resend the whole context each
+  turn, so trimming the filing payload and gating WebSearch cut tokens sharply.
 
 Agent loop: *read filing → quick stated score → if material form & above floor,
 pull reaction + fundamentals + news (+ BTC for crypto issuers) → reconcile into a
