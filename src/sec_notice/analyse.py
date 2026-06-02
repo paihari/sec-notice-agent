@@ -16,16 +16,34 @@ import sys
 
 from .config import config
 from .pipeline import analyse_filing, analyse_pending
-from .store.db import init_db
-from .store.models import Analysis
+from .store.db import init_db, session_scope
+from .store.models import Analysis, Company, Filing
 
 _SEV_ICON = {"info": "·", "notable": "•", "high": "▲", "critical": "■"}
 
 
+def _filing_header(filing_id: int) -> str:
+    """One-line filing identity: form, date, company/ticker, accession."""
+    with session_scope() as s:
+        f = s.get(Filing, filing_id)
+        if f is None:
+            return f"filing #{filing_id}"
+        company = s.get(Company, f.cik)
+        who = ""
+        if company and company.name:
+            who = f"  {company.name}"
+            if company.ticker:
+                who += f" ({company.ticker})"
+        return (f"filing #{f.id}  {f.form_type or '-'}  "
+                f"filed {f.filing_date or '-'}{who}\n"
+                f"    accession: {f.accession_no}")
+
+
 def _print_verdict(a: Analysis) -> None:
     icon = _SEV_ICON.get(a.severity or "", "?")
-    print(f"\n  {icon} filing #{a.filing_id}  score={a.materiality_score}  "
-          f"severity={a.severity}  action={a.recommended_action}")
+    print(f"\n  {icon} {_filing_header(a.filing_id)}")
+    print(f"    score={a.materiality_score}  severity={a.severity}  "
+          f"action={a.recommended_action}")
     if a.summary:
         print(f"    summary: {a.summary}")
     for r in (a.reasons or []):
